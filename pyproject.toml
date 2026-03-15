@@ -1,0 +1,32 @@
+[project]
+name = "xsmb-scraper"
+version = "0.1.0"
+description = "XSMB lottery results scraper"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx[http2]>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.1",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pydantic-settings>=2.5",
+    "structlog>=24.1",
+    "typer[all]>=0.12",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+xsmb = "src.main:app"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
