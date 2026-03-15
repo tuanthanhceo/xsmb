@@ -1,7 +1,9 @@
-.venv/
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
 .env
-exports/
+*.egg-info/
+dist/
+exports/*.csv
+exports/*.json
+exports/*.xlsx
+.venv/
