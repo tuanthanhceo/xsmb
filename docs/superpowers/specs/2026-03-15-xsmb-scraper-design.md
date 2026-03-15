@@ -62,12 +62,76 @@ Raw string = concatenation of all prizes in order = 107 characters.
 
 ### Database Schema
 
-Three tables:
-- **xsmb_results**: Main results table. Each prize stored as individual VARCHAR column (preserves leading zeros). Includes computed fields: `raw_string`, `loto_array`, `de_dau`, `de_duoi`. UNIQUE constraint on `draw_date`.
-- **scrape_jobs**: Tracks scrape job metadata (date range, status, counts).
-- **scrape_logs**: Per-day scrape attempt logs (status, source, errors, retry count, response time).
+```sql
+CREATE TABLE xsmb_results (
+    id SERIAL PRIMARY KEY,
+    draw_date DATE NOT NULL UNIQUE,
+    day_of_week SMALLINT NOT NULL,        -- 0=CN, 1=T2, ..., 6=T7
+    -- Prize columns (VARCHAR preserves leading zeros)
+    giai_db VARCHAR(5) NOT NULL,
+    giai_1 VARCHAR(5) NOT NULL,
+    giai_2_1 VARCHAR(5) NOT NULL, giai_2_2 VARCHAR(5) NOT NULL,
+    giai_3_1 VARCHAR(5) NOT NULL, giai_3_2 VARCHAR(5) NOT NULL,
+    giai_3_3 VARCHAR(5) NOT NULL, giai_3_4 VARCHAR(5) NOT NULL,
+    giai_3_5 VARCHAR(5) NOT NULL, giai_3_6 VARCHAR(5) NOT NULL,
+    giai_4_1 VARCHAR(4) NOT NULL, giai_4_2 VARCHAR(4) NOT NULL,
+    giai_4_3 VARCHAR(4) NOT NULL, giai_4_4 VARCHAR(4) NOT NULL,
+    giai_5_1 VARCHAR(4) NOT NULL, giai_5_2 VARCHAR(4) NOT NULL,
+    giai_5_3 VARCHAR(4) NOT NULL, giai_5_4 VARCHAR(4) NOT NULL,
+    giai_5_5 VARCHAR(4) NOT NULL, giai_5_6 VARCHAR(4) NOT NULL,
+    giai_6_1 VARCHAR(3) NOT NULL, giai_6_2 VARCHAR(3) NOT NULL,
+    giai_6_3 VARCHAR(3) NOT NULL,
+    giai_7_1 VARCHAR(2) NOT NULL, giai_7_2 VARCHAR(2) NOT NULL,
+    giai_7_3 VARCHAR(2) NOT NULL, giai_7_4 VARCHAR(2) NOT NULL,
+    -- Computed fields
+    raw_string VARCHAR(110),
+    loto_array TEXT[],
+    de_dau VARCHAR(2),                    -- last 2 digits of giai_db
+    de_duoi VARCHAR(2),                   -- last 2 digits of giai_7_1
+    -- Metadata
+    ky_tu VARCHAR(100),
+    source VARCHAR(50),                   -- 'ketqua_vn' | 'ketqua_net_batch' | 'ketqua_net_daily'
+    source_url TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
-Indexes on: `draw_date DESC`, `giai_db`, `de_dau`, `day_of_week`, and `(year, month)` composite.
+CREATE INDEX idx_xsmb_draw_date ON xsmb_results(draw_date DESC);
+CREATE INDEX idx_xsmb_giai_db ON xsmb_results(giai_db);
+CREATE INDEX idx_xsmb_de_dau ON xsmb_results(de_dau);
+CREATE INDEX idx_xsmb_day_of_week ON xsmb_results(day_of_week);
+CREATE INDEX idx_xsmb_year_month ON xsmb_results(
+    EXTRACT(YEAR FROM draw_date), EXTRACT(MONTH FROM draw_date)
+);
+
+CREATE TABLE scrape_jobs (
+    id SERIAL PRIMARY KEY,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending', -- pending|running|completed|failed|cancelled
+    total_days INT DEFAULT 0,
+    scraped_days INT DEFAULT 0,
+    skipped_days INT DEFAULT 0,
+    failed_days INT DEFAULT 0,
+    error_log TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE scrape_logs (
+    id SERIAL PRIMARY KEY,
+    job_id INT REFERENCES scrape_jobs(id),
+    draw_date DATE NOT NULL,
+    status VARCHAR(20) NOT NULL,          -- success|skipped|failed
+    source VARCHAR(50),
+    source_url TEXT,
+    error_message TEXT,
+    retry_count INT DEFAULT 0,
+    response_time_ms INT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
 ### Computed Fields
 
@@ -89,7 +153,17 @@ Rotating user agents from a pool of 4 common browser UA strings.
 
 ### Tet Holiday Handling
 
-XSMB does not draw during Tet (~4 days/year). Known ranges are hardcoded. If a date returns 404/empty AND falls within a Tet range, it is marked as `skipped` without retry.
+XSMB does not draw during Tet (~4 days/year). Known ranges hardcoded in `date_utils.py`:
+
+```
+2009: 25-28/01, 2010: 13-16/02, 2011: 02-05/02, 2012: 22-25/01
+2013: 09-12/02, 2014: 30/01-02/02, 2015: 18-21/02, 2016: 07-10/02
+2017: 27-30/01, 2018: 15-18/02, 2019: 04-07/02, 2020: 24-27/01
+2021: 11-14/02, 2022: 31/01-03/02, 2023: 21-24/01, 2024: 09-12/02
+2025: 28-31/01, 2026: 16-19/02
+```
+
+If a date returns 404/empty AND falls within a Tet range, it is marked as `skipped` without retry. Future Tet dates can be added to the config as needed.
 
 ### Idempotency & Resumability
 
@@ -97,12 +171,18 @@ XSMB does not draw during Tet (~4 days/year). Known ranges are hardcoded. If a d
 - Before scraping a date, check if it already exists in DB - skip if present
 - Jobs track progress (scraped/skipped/failed counts) for resume capability
 
+### Concurrency Model
+
+Sequential requests only (concurrency = 1). Each phase processes one date at a time with random delay between requests. No parallel requests - this respects rate limits and keeps the scraper simple and polite.
+
 ### Error Handling
 
-- 404 or no data: Check Tet range -> skip or flag
-- 403/429/5xx: Retry with exponential backoff, then fallback to Phase 3
-- Parse error: Log and continue to next date
-- Connection error: Retry with backoff
+- 404 or no data: Check Tet range -> skip (mark `skipped`) or flag as `failed`
+- 403/429/5xx: Retry 3x with exponential backoff (5s, 15s, 45s). If Phase 2 fails all retries, fallback to Phase 3 for that specific date. If Phase 3 also fails all retries, mark date as `failed` in scrape_logs and continue to next date.
+- Parse error: Log error details to scrape_logs, mark `failed`, continue to next date
+- Connection error: Same retry logic as 5xx
+- Phase 1 batch failure: Skip Phase 1 entirely, proceed to Phase 2 for all dates
+- No job-level abort threshold: scraper continues through all dates regardless of failure count. Failed dates can be retried later via `scrape resume`.
 
 ## Tech Stack
 
@@ -153,9 +233,11 @@ xsmb-scraper/
 │       ├── loto_utils.py           # Loto, de computation
 │       └── http_client.py          # Configured httpx + rate limit
 ├── tests/
-│   ├── test_parser.py
-│   ├── test_loto_utils.py
-│   └── fixtures/
+│   ├── test_parser.py              # HTML parsing for both sources
+│   ├── test_loto_utils.py          # Loto/de computation
+│   ├── test_date_utils.py          # Tet detection, date ranges
+│   ├── test_validation.py          # 27-number validation, raw_string
+│   └── fixtures/                   # Sample HTML files from each source
 └── exports/
 ```
 
@@ -170,14 +252,14 @@ xsmb-scraper/
 | `scrape today` | Scrape today only (for daily cron) |
 | `scrape resume` | Resume interrupted scrape job |
 | `status` | Show progress and statistics |
-| `verify --sample N` | Cross-validate N random days from both sources |
+| `verify --sample N` | Fetch N random existing dates from both sources, compare field-by-field. Report mismatches to stdout and scrape_logs. Exit code 1 if any mismatch. |
 | `export csv/json/excel` | Export with optional date range filter |
 
 ## Validation Rules
 
 Every parsed result must pass:
 1. Exactly 27 numbers total
-2. Correct digit count per prize tier (5/5/5/5/4/4/3/2)
+2. Correct digit count per prize: giai_db=5, giai_1=5, giai_2_*=5, giai_3_*=5, giai_4_*=4, giai_5_*=4, giai_6_*=3, giai_7_*=2
 3. All values are digits only (`^\d+$`)
 4. Reconstructed raw_string = 107 characters
 5. Loto array = 27 entries (last 2 digits of each prize, sorted)
@@ -189,6 +271,16 @@ JSON export includes metadata (total records, date range, export timestamp) and 
 ## Docker Setup
 
 PostgreSQL 16 Alpine via docker-compose. Scraper service depends on DB. Exports volume-mounted to `./exports/`.
+
+### Environment Variables (.env.example)
+
+```
+DATABASE_URL=postgresql+asyncpg://xsmb:xsmb_secret@localhost:5432/xsmb
+POSTGRES_DB=xsmb
+POSTGRES_USER=xsmb
+POSTGRES_PASSWORD=xsmb_secret
+LOG_LEVEL=INFO
+```
 
 ## Estimated Runtime
 
